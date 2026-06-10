@@ -79,6 +79,12 @@ func (h *Handler) HandleResponses(c *gin.Context) {
 	if v, ok := rawBody["input"]; ok {
 		req.Input = v
 	}
+	// 兼容 chat/completions 格式：用 messages 字段作为 input
+	if req.Input == nil {
+		if msgs, ok := rawBody["messages"].([]interface{}); ok && len(msgs) > 0 {
+			req.Input = msgs
+		}
+	}
 	if v, ok := rawBody["stream"].(bool); ok {
 		req.Stream = v
 	}

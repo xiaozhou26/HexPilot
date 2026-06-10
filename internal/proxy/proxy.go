@@ -99,18 +99,24 @@ func parseSSEToResponse(sseData []byte) (map[string]interface{}, error) {
 	var finishReason string
 
 	lines := strings.Split(string(sseData), "\n")
-	for _, line := range lines {
+	log.Printf("[parseSSE] total_lines=%d, raw_size=%d", len(lines), len(sseData))
+
+	for i, line := range lines {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
+			log.Printf("[parseSSE] hit [DONE] at line %d", i)
 			break
 		}
 
 		var chunk map[string]interface{}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			if i < 5 {
+				log.Printf("[parseSSE] line %d json error: %v, data=%s", i, err, data[:min(100, len(data))])
+			}
 			continue
 		}
 
@@ -143,6 +149,9 @@ func parseSSEToResponse(sseData []byte) (map[string]interface{}, error) {
 		}
 	}
 
+	log.Printf("[parseSSE] result: role=%s, content_len=%d, model=%s, finish=%s",
+		role, contentBuilder.Len(), model, finishReason)
+
 	if role == "" {
 		role = "assistant"
 	}
@@ -150,14 +159,14 @@ func parseSSEToResponse(sseData []byte) (map[string]interface{}, error) {
 		finishReason = "stop"
 	}
 
-	// 构建标准 OpenAI chat completion 响应
+	// 构建标准 OpenAI chat completion 响应（使用 []interface{} 类型以匹配 json.Unmarshal 的解析行为）
 	result := map[string]interface{}{
 		"id":      fmt.Sprintf("chatcmpl-%d", len(sseData)),
 		"object":  "chat.completion",
 		"created": 0,
 		"model":   model,
-		"choices": []map[string]interface{}{
-			{
+		"choices": []interface{}{
+			map[string]interface{}{
 				"index": 0,
 				"message": map[string]interface{}{
 					"role":    role,
