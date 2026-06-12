@@ -5,6 +5,7 @@
 ## 架构原理
 
 ```
+
 客户端 (Claude/ChatGPT等)
     │
     ▼
@@ -118,4 +119,45 @@ registry.Register("my_tool", "工具描述", func(ctx context.Context, args map[
     // 实现你的工具逻辑
     return "结果", nil
 })
+```
+
+## Codex Responses Provider
+
+HexPilot exposes an OpenAI-compatible Responses endpoint at:
+
+```text
+http://localhost:8080/v1/responses
+```
+
+Use this in your user-level Codex config, for example `C:\Users\<you>\.codex\config.toml`:
+
+```toml
+model = "deepseek/deepseek-chat-v3-0324"
+model_provider = "hexpilot"
+
+[model_providers.hexpilot]
+name = "HexPilot"
+base_url = "http://localhost:8080/v1"
+wire_api = "responses"
+env_key = "OPENAI_API_KEY"
+```
+
+HexPilot does not require an API key by default. If Codex requires the env var to exist, set a dummy value:
+
+```powershell
+$env:OPENAI_API_KEY = "dummy"
+```
+
+Smoke test:
+
+```powershell
+$body = '{"model":"deepseek/deepseek-chat-v3-0324","input":"ping","store":false}'
+curl.exe -sS -X POST http://localhost:8080/v1/responses -H "Content-Type: application/json" -d $body
+```
+
+Streaming smoke test:
+
+```powershell
+$body = '{"model":"deepseek/deepseek-chat-v3-0324","input":"ping","stream":true,"store":false}'
+curl.exe -N -X POST http://localhost:8080/v1/responses -H "Content-Type: application/json" -d $body
 ```

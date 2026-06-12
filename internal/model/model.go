@@ -1,141 +1,177 @@
 package model
 
-// OpenAI Responses API 兼容的请求结构
-// 完整支持 OpenAI (reasoning, verbosity, text), Anthropic (thinking, effort), Codex 等
+import "strings"
+
+// ResponsesRequest is the external /v1/responses request shape accepted by HexPilot.
 type ResponsesRequest struct {
-	// ===== 基础字段 =====
-	Model       string          `json:"model,omitempty"`
-	Input       interface{}     `json:"input"` // string 或 []InputItem
-	Stream      bool            `json:"stream,omitempty"`
-	MaxOutput   int             `json:"max_output_tokens,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Mode        string          `json:"mode,omitempty"` // "react" 或 "plan_execute"，本项目特有
+	Model       string      `json:"model,omitempty"`
+	Input       interface{} `json:"input,omitempty"`
+	Stream      bool        `json:"stream,omitempty"`
+	MaxOutput   int         `json:"max_output_tokens,omitempty"`
+	Temperature float64     `json:"temperature,omitempty"`
+	TopP        float64     `json:"top_p,omitempty"`
+	Mode        string      `json:"mode,omitempty"`
 
-	// ===== 指令/系统提示 =====
-	Instructions string `json:"instructions,omitempty"` // OpenAI Responses
-	Prompt       string `json:"prompt,omitempty"`       // 别名兼容
-	System       string `json:"system,omitempty"`       // Anthropic 兼容
+	Instructions string `json:"instructions,omitempty"`
+	Prompt       string `json:"prompt,omitempty"`
+	System       string `json:"system,omitempty"`
 
-	// ===== OpenAI reasoning 配置 =====
-	// "reasoning": {"effort": "minimal|low|medium|high"}
 	Reasoning *ReasoningConfig `json:"reasoning,omitempty"`
+	Thinking  *ThinkingConfig  `json:"thinking,omitempty"`
+	Effort    string           `json:"effort,omitempty"`
 
-	// ===== Anthropic thinking 配置 =====
-	// "thinking": {"type": "enabled", "budget_tokens": 4000}
-	Thinking *ThinkingConfig `json:"thinking,omitempty"`
+	Text      *TextConfig `json:"text,omitempty"`
+	Verbosity string      `json:"verbosity,omitempty"`
 
-	// ===== Anthropic effort 配置 =====
-	// "effort": "low|medium|high|extra|max"
-	Effort string `json:"effort,omitempty"`
+	Tools        []Tool      `json:"tools,omitempty"`
+	ToolChoice   interface{} `json:"tool_choice,omitempty"`
+	AllowedTools []string    `json:"allowed_tools,omitempty"`
 
-	// ===== OpenAI text verbosity =====
-	// "text": {"verbosity": "low|medium|high"}
-	Text *TextConfig `json:"text,omitempty"`
+	Truncation        string            `json:"truncation,omitempty"`
+	PreviousRespID    string            `json:"previous_response_id,omitempty"`
+	Store             bool              `json:"store,omitempty"`
+	ParallelToolCalls bool              `json:"parallel_tool_calls,omitempty"`
+	User              string            `json:"user,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
+	Include           []string          `json:"include,omitempty"`
+	StreamOptions     *StreamOptions    `json:"stream_options,omitempty"`
 
-	// ===== OpenAI verbosity (旧版别名) =====
-	Verbosity string `json:"verbosity,omitempty"`
+	UpstreamNativeTools bool   `json:"-"`
+	ResponseID          string `json:"-"`
 
-	// ===== 工具 =====
-	Tools      []Tool      `json:"tools,omitempty"`
-	ToolChoice interface{} `json:"tool_choice,omitempty"`
-
-	// ===== OpenAI allowed_tools (Codex/GPT-5 风格) =====
-	AllowedTools []string `json:"allowed_tools,omitempty"`
-
-	// ===== 杂项 =====
-	Truncation     string `json:"truncation,omitempty"`
-	PreviousRespID string `json:"previous_response_id,omitempty"`
-
-	// ===== 原始请求体（用于透传） =====
 	RawBody map[string]interface{} `json:"-"`
 }
 
-// OpenAI reasoning 配置
+func (r *ResponsesRequest) IsThinkingEnabled() bool {
+	if r.Reasoning != nil {
+		switch strings.ToLower(r.Reasoning.Effort) {
+		case "high", "extra", "max", "maximum":
+			return true
+		}
+	}
+	if r.Thinking != nil && strings.ToLower(r.Thinking.Type) == "enabled" {
+		return true
+	}
+	switch strings.ToLower(r.Effort) {
+	case "high", "extra", "max", "maximum":
+		return true
+	}
+	return false
+}
+
 type ReasoningConfig struct {
-	Effort string `json:"effort,omitempty"` // "minimal", "low", "medium", "high"
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
 }
 
-// Anthropic thinking 配置
 type ThinkingConfig struct {
-	Type         string `json:"type"`                   // "enabled" 或 "disabled"
-	BudgetTokens int    `json:"budget_tokens,omitempty"` // 思考 token 预算
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
-// OpenAI text verbosity 配置
 type TextConfig struct {
-	Verbosity string `json:"verbosity,omitempty"` // "low", "medium", "high"
+	Verbosity string      `json:"verbosity,omitempty"`
+	Format    *TextFormat `json:"format,omitempty"`
 }
 
-// ===== 工具定义 =====
+type TextFormat struct {
+	Type   string      `json:"type"`
+	Name   string      `json:"name,omitempty"`
+	Schema interface{} `json:"schema,omitempty"`
+	Strict *bool       `json:"strict,omitempty"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
+}
 
 type Tool struct {
-	Type        string     `json:"type"`
-	Name        string     `json:"name"`
-	Description string     `json:"description,omitempty"`
-	Parameters  *ToolParam `json:"parameters,omitempty"`
+	Type        string                 `json:"type"`
+	Name        string                 `json:"name,omitempty"`
+	Description string                 `json:"description,omitempty"`
+	Parameters  map[string]interface{} `json:"parameters,omitempty"`
+	Strict      *bool                  `json:"strict,omitempty"`
 }
-
-type ToolParam struct {
-	Type       string                 `json:"type"`
-	Properties map[string]interface{} `json:"properties,omitempty"`
-	Required   []string               `json:"required,omitempty"`
-}
-
-// ===== 输入项 =====
 
 type InputItem struct {
-	Type    string `json:"type"` // "message", "tool_call", "tool_result", "file_search_call", "computer_call"
-	Role    string `json:"role,omitempty"`
-	Content interface{} `json:"content"` // 可以是 string 或 []ContentBlock
+	ID        string      `json:"id,omitempty"`
+	Type      string      `json:"type,omitempty"`
+	Role      string      `json:"role,omitempty"`
+	Content   interface{} `json:"content,omitempty"`
+	CallID    string      `json:"call_id,omitempty"`
+	Name      string      `json:"name,omitempty"`
+	Arguments interface{} `json:"arguments,omitempty"`
+	Output    interface{} `json:"output,omitempty"`
+	Status    string      `json:"status,omitempty"`
 }
 
-// ===== 响应结构 =====
-
 type ResponsesResponse struct {
-	ID        string           `json:"id"`
-	Object    string           `json:"object"`            // "response"
-	Status    string           `json:"status"`            // "completed", "in_progress", "failed"
-	Output    []OutputItem     `json:"output"`
-	Model     string           `json:"model"`
-	CreatedAt int64            `json:"created_at,omitempty"`
-	Usage     *UsageInfo       `json:"usage,omitempty"`
-	Parallel  *ParallelConfig  `json:"parallel,omitempty"` // Codex 支持
+	ID        string       `json:"id"`
+	Object    string       `json:"object"`
+	CreatedAt int64        `json:"created_at,omitempty"`
+	Status    string       `json:"status"`
+	Error     interface{}  `json:"error,omitempty"`
+	Output    []OutputItem `json:"output"`
+
+	Instructions       *string           `json:"instructions,omitempty"`
+	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
+	Model              string            `json:"model"`
+	ParallelToolCalls  bool              `json:"parallel_tool_calls"`
+	PreviousResponseID *string           `json:"previous_response_id,omitempty"`
+	Reasoning          *ReasoningConfig  `json:"reasoning,omitempty"`
+	Store              *bool             `json:"store,omitempty"`
+	Temperature        *float64          `json:"temperature,omitempty"`
+	Text               *TextConfig       `json:"text,omitempty"`
+	ToolChoice         interface{}       `json:"tool_choice,omitempty"`
+	Tools              []Tool            `json:"tools,omitempty"`
+	TopP               *float64          `json:"top_p,omitempty"`
+	Truncation         string            `json:"truncation,omitempty"`
+	Usage              *UsageInfo        `json:"usage,omitempty"`
+	User               *string           `json:"user,omitempty"`
+	OutputText         string            `json:"output_text,omitempty"`
+	Parallel           *ParallelConfig   `json:"parallel,omitempty"`
 }
 
 type OutputItem struct {
-	Type      string                 `json:"type"` // "message", "function_call", "function_call_output"
-	ID        string                 `json:"id,omitempty"`
-	Name      string                 `json:"name,omitempty"`
-	Role      string                 `json:"role,omitempty"`
-	Content   []ContentBlock         `json:"content,omitempty"`
-	CallID    string                 `json:"call_id,omitempty"`
-	Arguments map[string]interface{} `json:"arguments,omitempty"`
-	Status    string                 `json:"status,omitempty"`
-	Output    string                 `json:"output,omitempty"` // function_call_output 的输出
+	Type      string         `json:"type"`
+	ID        string         `json:"id,omitempty"`
+	Name      string         `json:"name,omitempty"`
+	Role      string         `json:"role,omitempty"`
+	Content   []ContentBlock `json:"content,omitempty"`
+	CallID    string         `json:"call_id,omitempty"`
+	Arguments interface{}    `json:"arguments,omitempty"`
+	Status    string         `json:"status,omitempty"`
+	Output    string         `json:"output,omitempty"`
 }
 
 type ContentBlock struct {
-	Type     string `json:"type"` // "output_text", "thinking", "tool_use", "tool_result", "text"
-	Text     string `json:"text,omitempty"`
-	Content  string `json:"content,omitempty"` // 兼容格式
+	Type        string        `json:"type"`
+	Text        string        `json:"text,omitempty"`
+	Content     string        `json:"content,omitempty"`
+	Annotations []interface{} `json:"annotations,omitempty"`
+	Logprobs    []interface{} `json:"logprobs,omitempty"`
 }
 
-// ===== 使用信息 =====
-
 type UsageInfo struct {
-	InputTokens        int `json:"input_tokens,omitempty"`
-	OutputTokens       int `json:"output_tokens,omitempty"`
-	TotalTokens        int `json:"total_tokens,omitempty"`
-	ReasoningTokens    int `json:"reasoning_tokens,omitempty"`
-	CachedTokens       int `json:"cached_tokens,omitempty"`
+	InputTokens         int                 `json:"input_tokens,omitempty"`
+	InputTokensDetails  *InputTokensDetail  `json:"input_tokens_details,omitempty"`
+	OutputTokens        int                 `json:"output_tokens,omitempty"`
+	OutputTokensDetails *OutputTokensDetail `json:"output_tokens_details,omitempty"`
+	TotalTokens         int                 `json:"total_tokens,omitempty"`
+}
+
+type InputTokensDetail struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
+type OutputTokensDetail struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 type ParallelConfig struct {
 	MaxParallelism int `json:"max_parallelism,omitempty"`
 }
-
-// ===== SSE 事件（用于流式响应） =====
 
 type SSEEvent struct {
 	Type string      `json:"type"`

@@ -52,15 +52,21 @@ func (e *PlanExecuteEngine) Process(ctx context.Context, req *model.ResponsesReq
 	}
 
 	outputItems = append(outputItems, model.OutputItem{
-		Type: "message",
-		Role: "assistant",
+		Type:   "message",
+		Role:   "assistant",
+		Status: "completed",
 		Content: []model.ContentBlock{
-			{Type: "text", Text: finalResponse},
+			{Type: "output_text", Text: finalResponse},
 		},
 	})
 
+	responseID := req.ResponseID
+	if responseID == "" {
+		responseID = fmt.Sprintf("resp_plan_%d", len(outputItems))
+	}
+
 	return &model.ResponsesResponse{
-		ID:     fmt.Sprintf("resp_plan_%d", len(outputItems)),
+		ID:     responseID,
 		Object: "response",
 		Status: "completed",
 		Output: outputItems,
@@ -221,6 +227,18 @@ func extractUserInput(req *model.ResponsesRequest) string {
 			if itemMap, ok := item.(map[string]interface{}); ok {
 				if content, ok := itemMap["content"].(string); ok {
 					parts = append(parts, content)
+					continue
+				}
+				if blocks, ok := itemMap["content"].([]interface{}); ok {
+					for _, rawBlock := range blocks {
+						block, ok := rawBlock.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						if text, ok := block["text"].(string); ok {
+							parts = append(parts, text)
+						}
+					}
 				}
 			}
 		}

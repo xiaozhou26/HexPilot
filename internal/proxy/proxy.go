@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -24,26 +25,21 @@ func New(cfg *config.Config) *Proxy {
 	}
 }
 
-// ForwardRequest 转发请求到上游 API（非流式）
 func (p *Proxy) ForwardRequest(reqBody map[string]interface{}) (map[string]interface{}, error) {
-	// 确保非流式请求
 	reqBody["stream"] = false
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
-
-	// Debug: 打印完整请求体
 	log.Printf("[UPSTREAM REQ] %s", string(bodyBytes))
 
 	req, err := http.NewRequest("POST", p.config.UpstreamAPI+"/v1/chat/completions", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream, text/plain")
 	if p.config.UpstreamToken != "" {
 		req.Header.Set("Authorization", "Bearer "+p.config.UpstreamToken)
 	}
@@ -58,120 +54,161 @@ func (p *Proxy) ForwardRequest(reqBody map[string]interface{}) (map[string]inter
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
-
+	contentType := resp.Header.Get("Content-Type")
 	if resp.StatusCode != http.StatusOK {
-		// 检测是否返回了 HTML 页面（常见于反向代理配置错误）
-		contentType := resp.Header.Get("Content-Type")
-		if strings.Contains(contentType, "text/html") || strings.HasPrefix(strings.TrimSpace(string(respBody)), "<!DOCTYPE") {
-			return nil, fmt.Errorf("upstream returned HTML instead of JSON (status %d). This usually means UPSTREAM_API is pointing to a web UI, not an API endpoint. Check your .env file. Current UPSTREAM_API=%s", resp.StatusCode, p.config.UpstreamAPI)
+		if looksLikeHTML(contentType, respBody) {
+			return nil, fmt.Errorf("upstream returned HTML instead of API data (status %d). UPSTREAM_API may point to a web UI or the upstream adapter returned an HTML page. Current UPSTREAM_API=%s", resp.StatusCode, p.config.UpstreamAPI)
 		}
 		return nil, fmt.Errorf("upstream error %d: %s", resp.StatusCode, string(respBody))
 	}
-
-	// 检测响应内容类型
-	contentType := resp.Header.Get("Content-Type")
-	if strings.Contains(contentType, "text/html") || strings.HasPrefix(strings.TrimSpace(string(respBody)), "<!DOCTYPE") {
-		return nil, fmt.Errorf("upstream returned HTML instead of JSON (status 200). This usually means UPSTREAM_API is pointing to a web UI, not an API endpoint. Current UPSTREAM_API=%s, full URL=%s", p.config.UpstreamAPI, p.config.UpstreamAPI+"/v1/chat/completions")
+	if looksLikeHTML(contentType, respBody) {
+		return nil, fmt.Errorf("upstream returned HTML instead of API data (status 200). Current UPSTREAM_API=%s, full URL=%s. Test that URL directly; if it is an adapter like aichat, make sure the adapter itself is not receiving an HTML page from its remote upstream", p.config.UpstreamAPI, p.config.UpstreamAPI+"/v1/chat/completions")
 	}
 
-	// Debug: 打印原始响应
-	log.Printf("Upstream response (first 200 bytes): %s", string(respBody[:min(200, len(respBody))]))
+	log.Printf("Upstream response (first 1000 bytes): %s", string(respBody[:min(1000, len(respBody))]))
 
-	// 检测是否是 SSE 流格式（上游可能忽略 stream=false 仍返回流式）
-	if strings.HasPrefix(string(respBody), "data:") || strings.HasPrefix(string(respBody), "event:") || strings.Contains(string(respBody), "\ndata:") {
-		// 解析 SSE 流，提取最终回复
+	if isSSE(contentType, respBody) {
 		return parseSSEToResponse(respBody)
+	}
+	if !strings.Contains(contentType, "application/json") {
+		return wrapTextAsChatCompletion(respBody, reqBody), nil
 	}
 
 	var result map[string]interface{}
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("unmarshal response: %w (raw: %s)", err, string(respBody[:min(200, len(respBody))]))
 	}
-
+	if err := checkEmptyResponse(result, respBody); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
-// parseSSEToResponse 将上游 SSE 流解析为标准 OpenAI chat completion 响应
 func parseSSEToResponse(sseData []byte) (map[string]interface{}, error) {
 	var contentBuilder strings.Builder
 	var role string
-	var model string
+	var modelName string
 	var finishReason string
+	var toolCalls []map[string]interface{}
 
-	lines := strings.Split(string(sseData), "\n")
-	log.Printf("[parseSSE] total_lines=%d, raw_size=%d", len(lines), len(sseData))
-
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data: ") {
+	scanner := bufio.NewScanner(bytes.NewReader(sseData))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			log.Printf("[parseSSE] hit [DONE] at line %d", i)
-			break
+		data := strings.TrimPrefix(line, "data:")
+		if strings.HasPrefix(data, " ") {
+			data = data[1:]
+		}
+		control := strings.TrimSpace(data)
+		if control == "" || control == "[DONE]" {
+			if control == "[DONE]" {
+				break
+			}
+			continue
 		}
 
 		var chunk map[string]interface{}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			if i < 5 {
-				log.Printf("[parseSSE] line %d json error: %v, data=%s", i, err, data[:min(100, len(data))])
-			}
+			contentBuilder.WriteString(data)
 			continue
 		}
-
-		// 提取 model
 		if m, ok := chunk["model"].(string); ok && m != "" {
-			model = m
+			modelName = m
 		}
-
-		// 提取 choices
-		choices, ok := chunk["choices"].([]interface{})
-		if !ok || len(choices) == 0 {
-			continue
-		}
-
-		first := choices[0].(map[string]interface{})
-
-		// delta content
-		if delta, ok := first["delta"].(map[string]interface{}); ok {
-			if r, ok := delta["role"].(string); ok {
-				role = r
-			}
-			if c, ok := delta["content"].(string); ok {
-				contentBuilder.WriteString(c)
-			}
-		}
-
-		// finish_reason
-		if fr, ok := first["finish_reason"].(string); ok && fr != "null" {
-			finishReason = fr
-		}
+		appendChunkText(&contentBuilder, &role, &finishReason, &toolCalls, chunk)
 	}
-
-	log.Printf("[parseSSE] result: role=%s, content_len=%d, model=%s, finish=%s",
-		role, contentBuilder.Len(), model, finishReason)
-
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan SSE: %w", err)
+	}
 	if role == "" {
 		role = "assistant"
 	}
 	if finishReason == "" {
 		finishReason = "stop"
 	}
+	return chatCompletionResponseWithToolCalls(fmt.Sprintf("chatcmpl-%d", len(sseData)), modelName, role, contentBuilder.String(), finishReason, toolCalls), nil
+}
 
-	// 构建标准 OpenAI chat completion 响应（使用 []interface{} 类型以匹配 json.Unmarshal 的解析行为）
-	result := map[string]interface{}{
-		"id":      fmt.Sprintf("chatcmpl-%d", len(sseData)),
+func appendChunkText(contentBuilder *strings.Builder, role *string, finishReason *string, toolCalls *[]map[string]interface{}, chunk map[string]interface{}) {
+	choices, ok := chunk["choices"].([]interface{})
+	if ok && len(choices) > 0 {
+		first, ok := choices[0].(map[string]interface{})
+		if !ok {
+			return
+		}
+		if delta, ok := first["delta"].(map[string]interface{}); ok {
+			if r, ok := delta["role"].(string); ok && r != "" {
+				*role = r
+			}
+			if c, ok := delta["content"].(string); ok {
+				contentBuilder.WriteString(c)
+			}
+			if rawToolCalls, ok := delta["tool_calls"].([]interface{}); ok {
+				mergeStreamingToolCalls(rawToolCalls, toolCalls)
+			}
+		}
+		if message, ok := first["message"].(map[string]interface{}); ok {
+			if r, ok := message["role"].(string); ok && r != "" {
+				*role = r
+			}
+			if c, ok := message["content"].(string); ok {
+				contentBuilder.WriteString(c)
+			}
+			if rawToolCalls, ok := message["tool_calls"].([]interface{}); ok {
+				*toolCalls = normalizeToolCalls(rawToolCalls)
+			}
+		}
+		if fr, ok := first["finish_reason"].(string); ok && fr != "" && fr != "null" {
+			*finishReason = fr
+		}
+		return
+	}
+
+	for _, key := range []string{"content", "text", "delta", "message"} {
+		if text, ok := chunk[key].(string); ok {
+			contentBuilder.WriteString(text)
+			return
+		}
+	}
+}
+
+func wrapTextAsChatCompletion(body []byte, reqBody map[string]interface{}) map[string]interface{} {
+	modelName, _ := reqBody["model"].(string)
+	return chatCompletionResponse(
+		fmt.Sprintf("chatcmpl-text-%d", len(body)),
+		modelName,
+		"assistant",
+		strings.TrimSpace(string(body)),
+		"stop",
+	)
+}
+
+func chatCompletionResponse(id, modelName, role, content, finishReason string) map[string]interface{} {
+	return chatCompletionResponseWithToolCalls(id, modelName, role, content, finishReason, nil)
+}
+
+func chatCompletionResponseWithToolCalls(id, modelName, role, content, finishReason string, toolCalls []map[string]interface{}) map[string]interface{} {
+	message := map[string]interface{}{
+		"role":    role,
+		"content": content,
+	}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = mapsToInterfaces(toolCalls)
+		if finishReason == "" || finishReason == "stop" {
+			finishReason = "tool_calls"
+		}
+	}
+	return map[string]interface{}{
+		"id":      id,
 		"object":  "chat.completion",
 		"created": 0,
-		"model":   model,
+		"model":   modelName,
 		"choices": []interface{}{
 			map[string]interface{}{
-				"index": 0,
-				"message": map[string]interface{}{
-					"role":    role,
-					"content": contentBuilder.String(),
-				},
+				"index":         0,
+				"message":       message,
 				"finish_reason": finishReason,
 			},
 		},
@@ -181,11 +218,84 @@ func parseSSEToResponse(sseData []byte) (map[string]interface{}, error) {
 			"total_tokens":      0,
 		},
 	}
-
-	return result, nil
 }
 
-// ForwardRequestStream 转发请求到上游 API（流式）
+func mergeStreamingToolCalls(rawToolCalls []interface{}, toolCalls *[]map[string]interface{}) {
+	for _, raw := range rawToolCalls {
+		delta, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		index := intFromNumber(delta["index"], len(*toolCalls))
+		for len(*toolCalls) <= index {
+			*toolCalls = append(*toolCalls, map[string]interface{}{})
+		}
+		current := (*toolCalls)[index]
+		if id, ok := delta["id"].(string); ok && id != "" {
+			current["id"] = id
+		}
+		if typ, ok := delta["type"].(string); ok && typ != "" {
+			current["type"] = typ
+		} else if current["type"] == nil {
+			current["type"] = "function"
+		}
+		if fnDelta, ok := delta["function"].(map[string]interface{}); ok {
+			mergeFunctionDelta(current, fnDelta)
+		}
+	}
+}
+
+func mergeFunctionDelta(current map[string]interface{}, fnDelta map[string]interface{}) {
+	fnCurrent, ok := current["function"].(map[string]interface{})
+	if !ok {
+		fnCurrent = map[string]interface{}{}
+		current["function"] = fnCurrent
+	}
+	if name, ok := fnDelta["name"].(string); ok && name != "" {
+		fnCurrent["name"] = name
+	}
+	if args, ok := fnDelta["arguments"].(string); ok {
+		existing, _ := fnCurrent["arguments"].(string)
+		fnCurrent["arguments"] = existing + args
+	}
+}
+
+func normalizeToolCalls(rawToolCalls []interface{}) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(rawToolCalls))
+	for _, raw := range rawToolCalls {
+		toolCall, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if _, ok := toolCall["type"].(string); !ok {
+			toolCall["type"] = "function"
+		}
+		out = append(out, toolCall)
+	}
+	return out
+}
+
+func mapsToInterfaces(items []map[string]interface{}) []interface{} {
+	out := make([]interface{}, 0, len(items))
+	for _, item := range items {
+		out = append(out, item)
+	}
+	return out
+}
+
+func intFromNumber(value interface{}, fallback int) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return fallback
+	}
+}
+
 func (p *Proxy) ForwardRequestStream(reqBody map[string]interface{}, onChunk func([]byte) error) error {
 	reqBody["stream"] = true
 
@@ -198,9 +308,8 @@ func (p *Proxy) ForwardRequestStream(reqBody map[string]interface{}, onChunk fun
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
-
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Accept", "text/event-stream, application/json, text/plain")
 	if p.config.UpstreamToken != "" {
 		req.Header.Set("Authorization", "Bearer "+p.config.UpstreamToken)
 	}
@@ -216,7 +325,6 @@ func (p *Proxy) ForwardRequestStream(reqBody map[string]interface{}, onChunk fun
 		return fmt.Errorf("upstream error %d: %s", resp.StatusCode, string(body))
 	}
 
-	// 逐行读取 SSE 流
 	buf := make([]byte, 4096)
 	for {
 		n, err := resp.Body.Read(buf)
@@ -234,6 +342,48 @@ func (p *Proxy) ForwardRequestStream(reqBody map[string]interface{}, onChunk fun
 			return fmt.Errorf("read stream: %w", err)
 		}
 	}
-
 	return nil
+}
+
+func isSSE(contentType string, body []byte) bool {
+	bodyText := string(body)
+	return strings.Contains(contentType, "text/event-stream") ||
+		strings.HasPrefix(bodyText, "data:") ||
+		strings.HasPrefix(bodyText, "event:") ||
+		strings.Contains(bodyText, "\ndata:")
+}
+
+func checkEmptyResponse(result map[string]interface{}, rawBody []byte) error {
+	choices, ok := result["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return fmt.Errorf("upstream returned empty choices (raw: %s)", string(rawBody[:min(200, len(rawBody))]))
+	}
+	first, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	message, ok := first["message"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	content, _ := message["content"].(string)
+	toolCalls, hasToolCalls := message["tool_calls"]
+	finishReason, _ := first["finish_reason"].(string)
+	if content == "" && !hasToolCalls && (finishReason == "" || finishReason == "null") {
+		if toolCalls != nil {
+			if tc, ok := toolCalls.([]interface{}); ok && len(tc) > 0 {
+				return nil
+			}
+		}
+		return fmt.Errorf("upstream returned empty content with no tool_calls (raw: %s)", string(rawBody[:min(300, len(rawBody))]))
+	}
+	return nil
+}
+
+func looksLikeHTML(contentType string, body []byte) bool {
+	trimmed := strings.TrimSpace(string(body))
+	return strings.Contains(contentType, "text/html") ||
+		strings.HasPrefix(trimmed, "<!DOCTYPE") ||
+		strings.HasPrefix(trimmed, "<html") ||
+		strings.HasPrefix(trimmed, "<HTML")
 }

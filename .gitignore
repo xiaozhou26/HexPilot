@@ -1,2 +1,4 @@
 /.env
 hexpilot.exe
+.atomcode/
+.claude/

@@ -120,7 +120,7 @@ func (e *ChatCompletionsEngine) Process(ctx context.Context, rawReq map[string]i
 
 	// 达到最大工具调用次数，返回当前状态
 	return map[string]interface{}{
-		"id":     fmt.Sprintf("chatcmpl-%d", rand.Intn(99999)),
+		"id":     fmt.Sprintf("chatcmpl-%d", rand.Intn(80809)),
 		"object": "chat.completion",
 		"model":  model,
 		"choices": []interface{}{
@@ -179,7 +179,7 @@ func getFloat(m map[string]interface{}, key string, fallback float64) float64 {
 // ToChatCompletionResponse 将 ReAct 引擎的 ResponsesResponse 转换为 chat/completions 格式
 func ToChatCompletionResponse(resp *model.ResponsesResponse) map[string]interface{} {
 	var contentParts []string
-	var toolCalls []map[string]interface{}
+	var toolCalls []interface{}
 
 	for _, item := range resp.Output {
 		switch item.Type {
@@ -187,15 +187,31 @@ func ToChatCompletionResponse(resp *model.ResponsesResponse) map[string]interfac
 			for _, block := range item.Content {
 				if block.Text != "" {
 					contentParts = append(contentParts, block.Text)
+				} else if block.Content != "" {
+					contentParts = append(contentParts, block.Content)
 				}
 			}
-		case "tool_call":
+		case "tool_call", "function_call":
+			args := "{}"
+			if item.Arguments != nil {
+				switch value := item.Arguments.(type) {
+				case string:
+					if strings.TrimSpace(value) != "" {
+						args = value
+					}
+				default:
+					data, err := json.Marshal(value)
+					if err == nil {
+						args = string(data)
+					}
+				}
+			}
 			toolCalls = append(toolCalls, map[string]interface{}{
 				"id":   item.CallID,
 				"type": "function",
 				"function": map[string]interface{}{
 					"name":      item.Name,
-					"arguments": "{}",
+					"arguments": args,
 				},
 			})
 		}

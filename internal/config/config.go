@@ -8,27 +8,29 @@ import (
 )
 
 type Config struct {
-	ServerPort    string
-	UpstreamAPI   string // 逆向 API 地址
-	UpstreamToken string // 逆向 API 的 token（如果有）
-	DefaultMode   string // "react" or "plan_execute"
+	ServerPort          string
+	UpstreamAPI         string
+	UpstreamToken       string
+	DefaultMode         string
+	DefaultModel        string
+	UpstreamNativeTools bool
 }
 
 func Load() *Config {
-	// 加载 .env 文件（如果存在）
 	_ = godotenv.Load()
-	// 也尝试加载 .env.local（优先级更高）
 	_ = godotenv.Load(".env.local")
 
 	cfg := &Config{
-		ServerPort:    getEnv("SERVER_PORT", "8080"),
-		UpstreamAPI:   getEnv("UPSTREAM_API", "https://api.example.com"),
-		UpstreamToken: getEnv("UPSTREAM_TOKEN", ""),
-		DefaultMode:   getEnv("DEFAULT_MODE", "react"),
+		ServerPort:          getEnv("SERVER_PORT", "8080"),
+		UpstreamAPI:         getEnv("UPSTREAM_API", "https://api.example.com"),
+		UpstreamToken:       getEnv("UPSTREAM_TOKEN", ""),
+		DefaultMode:         getEnv("DEFAULT_MODE", "react"),
+		DefaultModel:        getEnv("DEFAULT_MODEL", "deepseek/deepseek-chat-v3-0324"),
+		UpstreamNativeTools: getEnvBool("UPSTREAM_NATIVE_TOOLS", false),
 	}
 
-	log.Printf("配置已加载: SERVER_PORT=%s, UPSTREAM_API=%s, DEFAULT_MODE=%s",
-		cfg.ServerPort, cfg.UpstreamAPI, cfg.DefaultMode)
+	log.Printf("config loaded: SERVER_PORT=%s, UPSTREAM_API=%s, DEFAULT_MODE=%s, DEFAULT_MODEL=%s, UPSTREAM_NATIVE_TOOLS=%v",
+		cfg.ServerPort, cfg.UpstreamAPI, cfg.DefaultMode, cfg.DefaultModel, cfg.UpstreamNativeTools)
 
 	return cfg
 }
@@ -38,4 +40,15 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	switch os.Getenv(key) {
+	case "1", "true", "TRUE", "yes", "YES", "on", "ON":
+		return true
+	case "0", "false", "FALSE", "no", "NO", "off", "OFF":
+		return false
+	default:
+		return fallback
+	}
 }
