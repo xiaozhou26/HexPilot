@@ -38,6 +38,8 @@ type ResponsesRequest struct {
 
 	UpstreamNativeTools bool   `json:"-"`
 	ResponseID          string `json:"-"`
+	TopK                *int   `json:"top_k,omitempty"`
+	StopSequences       []string `json:"stop_sequences,omitempty"`
 
 	RawBody map[string]interface{} `json:"-"`
 }

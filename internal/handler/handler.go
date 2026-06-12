@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -342,6 +343,11 @@ func (h *Handler) HandleMessages(c *gin.Context) {
 		return
 	}
 
+	// Accept Claude Code headers silently -- not forwarded upstream.
+	c.Request.Header.Del("x-api-key")
+	c.Request.Header.Del("anthropic-version")
+	c.Request.Header.Del("anthropic-dangerous-direct-browser-access")
+
 	// 转换为 ResponsesRequest
 	req := h.anthropicToInternal(rawReq)
 
@@ -417,6 +423,8 @@ func (h *Handler) chatCompletionsToResponsesRequest(req map[string]interface{}) 
 		MaxOutput:           getInt(req, "max_tokens", 0),
 		Temperature:         getFloat(req, "temperature", 0),
 		TopP:                getFloat(req, "top_p", 0),
+		TopK:                getTopK(req),
+		StopSequences:       getStringSlice(req, "stop_sequences"),
 		ToolChoice:          req["tool_choice"],
 		ParallelToolCalls:   getBool(req, "parallel_tool_calls", true),
 		Store:               getBool(req, "store", false),
@@ -566,6 +574,8 @@ func (h *Handler) ListModels(c *gin.Context) {
 		h.config.DefaultModel,
 		"deepseek/deepseek-chat-v3-0324",
 		"gpt-5",
+		"hexpilot-tool-use-v1",
+		"hexpilot-reasoning-v1",
 	})
 	data := make([]gin.H, 0, len(modelIDs))
 	for _, id := range modelIDs {
@@ -632,6 +642,9 @@ func (h *Handler) handleAnthropicSync(c *gin.Context, req *model.ResponsesReques
 		return
 	}
 
+	h.enrichResponse(result, req)
+	h.storeResponseContext(result.ID, req, result)
+
 	// 转换为 Anthropic 格式响应
 	c.JSON(http.StatusOK, h.toAnthropicResponse(result))
 }
@@ -639,32 +652,157 @@ func (h *Handler) handleAnthropicSync(c *gin.Context, req *model.ResponsesReques
 func (h *Handler) handleAnthropicStream(c *gin.Context, req *model.ResponsesRequest, mode string) {
 	h.setupSSEHeaders(c)
 
-	// Anthropic 流式事件
+	messageID := newMessageID()
+	modelName := req.Model
+	if modelName == "" {
+		modelName = h.config.DefaultModel
+	}
+
+	var toolCallsDetected []map[string]interface{}
+	textStarted := false
+	blockIndex := 0
+
+	// 1. message_start
 	h.sendRawSSE(c, "message_start", gin.H{
-		"type": "message",
-		"role": "assistant",
+		"type": "message_start",
+		"message": gin.H{
+			"id":    messageID,
+			"type":  "message",
+			"role":  "assistant",
+			"model": modelName,
+			"usage": gin.H{"input_tokens": 0, "output_tokens": 1},
+		},
 	})
 
-	err := h.streamMode(c, req, mode, func(event *model.SSEEvent) error {
-		h.sendRawSSE(c, "content_block_delta", gin.H{
-			"index": 0,
+	// Ping keepalive for slow upstreams
+	pingDone := make(chan struct{})
+	pingTicker := time.NewTicker(10 * time.Second)
+	go func() {
+		for {
+			select {
+			case <-pingTicker.C:
+				h.sendRawSSE(c, "ping", nil)
+				c.Writer.Flush()
+			case <-pingDone:
+				return
+			}
+		}
+	}()
+
+	// 2. Stream through the engine
+	streamErr := h.streamMode(c, req, mode,
+		func(event *model.SSEEvent) error {
+			switch event.Type {
+			case "response.output_text.delta":
+				delta, _ := event.Data.(map[string]interface{})
+				text, _ := delta["delta"].(string)
+				if !textStarted {
+					h.sendRawSSE(c, "content_block_start", gin.H{
+						"index": blockIndex,
+						"content_block": gin.H{
+							"type": "text",
+							"text": "",
+						},
+					})
+					textStarted = true
+					c.Writer.Flush()
+				}
+				h.sendRawSSE(c, "content_block_delta", gin.H{
+					"index": blockIndex,
+					"delta": gin.H{"type": "text_delta", "text": text},
+				})
+				c.Writer.Flush()
+			}
+			return nil
+		},
+		func(tc map[string]interface{}) {
+			toolCallsDetected = append(toolCallsDetected, tc)
+		},
+	)
+
+	pingTicker.Stop()
+	close(pingDone)
+
+	// Emit error early if stream failed (before normal finalization)
+	if streamErr != nil {
+		if textStarted {
+			h.sendRawSSE(c, "content_block_stop", gin.H{"index": blockIndex})
+		}
+		for i := range toolCallsDetected {
+			h.sendRawSSE(c, "content_block_stop", gin.H{"index": blockIndex + 1 + i})
+		}
+		h.sendRawSSE(c, "message_delta", gin.H{
+			"type": "message_delta",
 			"delta": gin.H{
-				"type": "text_delta",
-				"text": fmt.Sprintf("%v", event.Data),
+				"stop_reason":   "error",
+				"stop_sequence": nil,
 			},
+			"usage": gin.H{"output_tokens": 0},
 		})
+		h.sendRawSSE(c, "error", gin.H{
+			"type":    "upstream_error",
+			"message": streamErr.Error(),
+		})
+		h.sendRawSSE(c, "message_stop", gin.H{"type": "message_stop"})
 		c.Writer.Flush()
-		return nil
-	})
-
-	if err != nil {
-		h.sendRawSSE(c, "error", gin.H{"message": err.Error()})
 		return
 	}
+
+	// 3. Finalize text block (text is always at blockIndex=0)
+	if textStarted {
+		h.sendRawSSE(c, "content_block_stop", gin.H{"index": 0})
+		blockIndex = 1
+	}
+
+	// 4. Emit tool_use blocks if any tool calls were detected
+	stopReason := "end_turn"
+	if len(toolCallsDetected) > 0 {
+		stopReason = "tool_use"
+		for _, tc := range toolCallsDetected {
+			fn, _ := tc["function"].(map[string]interface{})
+			name, _ := fn["name"].(string)
+			argsJSON, _ := fn["arguments"].(string)
+			if argsJSON == "" {
+				argsJSON = "{}"
+			}
+
+			h.sendRawSSE(c, "content_block_start", gin.H{
+				"index": blockIndex,
+				"content_block": gin.H{
+					"type": "tool_use",
+					"id":   tc["id"],
+					"name": name,
+					"input": gin.H{},
+				},
+			})
+			c.Writer.Flush()
+
+			for _, chunk := range chunkString(argsJSON, 64) {
+				h.sendRawSSE(c, "content_block_delta", gin.H{
+					"index": blockIndex,
+					"delta": gin.H{"type": "input_json_delta", "partial_json": chunk},
+				})
+				c.Writer.Flush()
+			}
+
+			h.sendRawSSE(c, "content_block_stop", gin.H{"index": blockIndex})
+			c.Writer.Flush()
+			blockIndex++
+		}
+	}
+
+	// 5. message_delta with stop_reason
 	h.sendRawSSE(c, "message_delta", gin.H{
-		"stop_reason": "end_turn",
+		"type": "message_delta",
+		"delta": gin.H{
+			"stop_reason":   stopReason,
+			"stop_sequence": nil,
+		},
+		"usage": gin.H{"output_tokens": 0},
 	})
-	h.sendRawSSE(c, "message_stop", nil)
+
+	// 6. message_stop
+	h.sendRawSSE(c, "message_stop", gin.H{"type": "message_stop"})
 	c.Writer.Flush()
 }
 
@@ -679,18 +817,18 @@ func (h *Handler) executeMode(c *gin.Context, req *model.ResponsesRequest, mode 
 	}
 }
 
-func (h *Handler) streamMode(c *gin.Context, req *model.ResponsesRequest, mode string, onEvent func(*model.SSEEvent) error) error {
+func (h *Handler) streamMode(c *gin.Context, req *model.ResponsesRequest, mode string, onEvent func(*model.SSEEvent) error, onToolCall func(map[string]interface{})) error {
 	switch mode {
 	case "plan_execute":
-		return h.streamPlanExecute(c, req, onEvent)
+		return h.streamPlanExecute(c, req, onEvent, nil)
 	case "react":
 		fallthrough
 	default:
-		return h.reactEngine.ProcessStream(c.Request.Context(), req, onEvent)
+		return h.reactEngine.ProcessStream(c.Request.Context(), req, onEvent, onToolCall)
 	}
 }
 
-func (h *Handler) streamPlanExecute(c *gin.Context, req *model.ResponsesRequest, onEvent func(*model.SSEEvent) error) error {
+func (h *Handler) streamPlanExecute(c *gin.Context, req *model.ResponsesRequest, onEvent func(*model.SSEEvent) error, _ func(map[string]interface{})) error {
 	onEvent(&model.SSEEvent{Type: "plan.started", Data: gin.H{"message": "Generating plan..."}})
 
 	result, err := h.planExecEngine.Process(c.Request.Context(), req)
@@ -950,9 +1088,67 @@ func (h *Handler) anthropicToInternal(raw map[string]interface{}) model.Response
 					Name:        getString(tMap, "name", ""),
 					Description: getString(tMap, "description", ""),
 				}
+				if s, ok := tMap["input_schema"].(map[string]interface{}); ok {
+					tool.Parameters = s
+				}
 				req.Tools = append(req.Tools, tool)
 			}
 		}
+	}
+
+	// temperature / top_p / top_k
+	req.Temperature = getFloat(raw, "temperature", 0)
+	req.TopP = getFloat(raw, "top_p", 0)
+	if v, ok := raw["top_k"].(float64); ok {
+		k := int(v)
+		req.TopK = &k
+	}
+
+	// tool_choice
+	if v, ok := raw["tool_choice"]; ok {
+		req.ToolChoice = v
+	}
+
+	// stop_sequences
+	if ss, ok := raw["stop_sequences"].([]interface{}); ok {
+		for _, s := range ss {
+			if str, ok := s.(string); ok {
+				req.StopSequences = append(req.StopSequences, str)
+			}
+		}
+	}
+
+	// metadata (extract user_id)
+	if m, ok := raw["metadata"].(map[string]interface{}); ok {
+		meta := make(map[string]string, len(m))
+		for k, val := range m {
+			if s, ok := val.(string); ok {
+				meta[k] = s
+			}
+		}
+		req.Metadata = meta
+	}
+
+	// system as array of text blocks
+	if sys, ok := raw["system"]; ok && req.Instructions == "" {
+		if blocks, ok := sys.([]interface{}); ok {
+			var parts []string
+			for _, b := range blocks {
+				if bMap, ok := b.(map[string]interface{}); ok {
+					if t, ok := bMap["text"].(string); ok && t != "" {
+						parts = append(parts, t)
+					}
+				}
+			}
+			if len(parts) > 0 {
+				req.Instructions = strings.Join(parts, "\n\n")
+			}
+		}
+	}
+
+	// mcp_servers (not yet supported)
+	if _, ok := raw["mcp_servers"]; ok {
+		log.Printf("[WARN] mcp_servers present in /v1/messages request but not yet supported; ignoring")
 	}
 
 	return req
@@ -961,33 +1157,56 @@ func (h *Handler) anthropicToInternal(raw map[string]interface{}) model.Response
 func (h *Handler) toAnthropicResponse(resp *model.ResponsesResponse) gin.H {
 	var contentBlocks []gin.H
 	var textParts []string
+	hasToolCalls := false
+
 	for _, item := range resp.Output {
-		for _, block := range item.Content {
-			if block.Text != "" || block.Content != "" {
-				text := block.Text
-				if text == "" {
-					text = block.Content
+		switch item.Type {
+		case "message":
+			for _, block := range item.Content {
+				if block.Text != "" || block.Content != "" {
+					text := block.Text
+					if text == "" {
+						text = block.Content
+					}
+					textParts = append(textParts, text)
+					contentBlocks = append(contentBlocks, gin.H{
+						"type": "text",
+						"text": text,
+					})
 				}
-				textParts = append(textParts, text)
-				contentBlocks = append(contentBlocks, gin.H{
-					"type": "text",
-					"text": text,
-				})
 			}
+		case "function_call":
+			hasToolCalls = true
+			argsMap := map[string]interface{}{}
+			if s, ok := item.Arguments.(string); ok && s != "" {
+				json.Unmarshal([]byte(s), &argsMap)
+			}
+			contentBlocks = append(contentBlocks, gin.H{
+				"type":  "tool_use",
+				"id":    item.CallID,
+				"name":  item.Name,
+				"input": argsMap,
+			})
 		}
 	}
 
+	stopReason := "end_turn"
+	if hasToolCalls {
+		stopReason = "tool_use"
+	}
+
+	allText := strings.Join(textParts, " ")
 	return gin.H{
 		"id":            resp.ID,
 		"type":          "message",
 		"role":          "assistant",
 		"content":       contentBlocks,
 		"model":         resp.Model,
-		"stop_reason":   "end_turn",
+		"stop_reason":   stopReason,
 		"stop_sequence": nil,
 		"usage": gin.H{
 			"input_tokens":  0,
-			"output_tokens": len(strings.Join(textParts, " ")),
+			"output_tokens": len(allText) + len(contentBlocks)*4,
 		},
 	}
 }
@@ -1137,6 +1356,38 @@ func getBool(m map[string]interface{}, key string, fallback bool) bool {
 		return v
 	}
 	return fallback
+}
+
+func getTopK(m map[string]interface{}) *int {
+	switch v := m["top_k"].(type) {
+	case float64:
+		k := int(v)
+		return &k
+	case int:
+		return &v
+	}
+	return nil
+}
+
+func getStringSlice(m map[string]interface{}, key string) []string {
+	raw, ok := m[key]
+	if !ok {
+		return nil
+	}
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, s := range arr {
+		if str, ok := s.(string); ok {
+			out = append(out, str)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func mapKeys(m map[string]interface{}) []string {
@@ -1434,6 +1685,10 @@ func newResponseID() string {
 
 func newChatCompletionID() string {
 	return fmt.Sprintf("chatcmpl_%d", time.Now().UnixNano())
+}
+
+func newMessageID() string {
+	return "msg_" + strconv.FormatInt(time.Now().UnixNano(), 10)
 }
 
 func uniqueStrings(values []string) []string {

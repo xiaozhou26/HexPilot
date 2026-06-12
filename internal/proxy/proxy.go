@@ -321,25 +321,49 @@ func (p *Proxy) ForwardRequestStream(reqBody map[string]interface{}, onChunk fun
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("upstream error %d: %s", resp.StatusCode, string(body))
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("upstream error %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	// Accumulate the full body before processing so that non-SSE (plain JSON)
+	// responses are parsed as complete objects rather than partial chunks.
+	var fullBody bytes.Buffer
 	buf := make([]byte, 4096)
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			if cbErr := onChunk(chunk); cbErr != nil {
-				return cbErr
-			}
+			fullBody.Write(buf[:n])
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return fmt.Errorf("read stream: %w", err)
+		}
+	}
+	body := fullBody.Bytes()
+
+	if isSSE(resp.Header.Get("Content-Type"), body) {
+		// SSE path: emit each data line individually.
+		scanner := bufio.NewScanner(bytes.NewReader(body))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				break
+			}
+			if cbErr := onChunk([]byte(data)); cbErr != nil {
+				return cbErr
+			}
+		}
+	} else {
+		// Non-SSE path: pass the complete body as a single chunk so the
+		// callback can parse it as a full JSON object.
+		if cbErr := onChunk(body); cbErr != nil {
+			return cbErr
 		}
 	}
 	return nil

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -301,7 +302,7 @@ func executeTool(ctx context.Context, registry *tools.ToolRegistry, reqTools []m
 	return fmt.Sprintf("Error: unknown tool '%s'", name)
 }
 
-func (e *ReActEngine) ProcessStream(ctx context.Context, req *model.ResponsesRequest, onEvent func(*model.SSEEvent) error) error {
+func (e *ReActEngine) ProcessStream(ctx context.Context, req *model.ResponsesRequest, onEvent func(*model.SSEEvent) error, onToolCall func(map[string]interface{})) error {
 	toolList := formatToolListFromRequest(req)
 	toolDefs := convertRequestToolsToOpenAI(req)
 	messages := buildInitialMessages(req, toolList)
@@ -320,46 +321,33 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, req *model.ResponsesReq
 		var currentToolCall map[string]interface{}
 
 		err := e.proxy.ForwardRequestStream(upstreamReq, func(chunk []byte) error {
-			lines := strings.Split(string(chunk), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if !strings.HasPrefix(line, "data: ") {
-					continue
-				}
-				data := strings.TrimPrefix(line, "data: ")
+			chunkStr := string(chunk)
+			if strings.HasPrefix(chunkStr, "data: ") {
+				// SSE path: each chunk is a "data: {...}" line
+				data := strings.TrimPrefix(chunkStr, "data: ")
 				if data == "[DONE]" {
-					continue
+					return nil
 				}
-
-				var event map[string]interface{}
-				if err := json.Unmarshal([]byte(data), &event); err != nil {
-					continue
+				delta, err := parseDeltaFromSSEData(data)
+				if err != nil {
+					return nil
 				}
-
-				choices, ok := event["choices"].([]interface{})
-				if !ok || len(choices) == 0 {
-					continue
+				if delta == nil {
+					return nil
 				}
-				choice, ok := choices[0].(map[string]interface{})
-				if !ok {
-					continue
-				}
-				delta, ok := choice["delta"].(map[string]interface{})
-				if !ok {
-					continue
-				}
-
 				mergeStreamingToolCalls(delta, &currentToolCall, &toolCalls)
-
 				if content, ok := delta["content"].(string); ok && content != "" {
 					contentBuilder.WriteString(content)
-					if err := onEvent(&model.SSEEvent{
+					if evErr := onEvent(&model.SSEEvent{
 						Type: "response.output_text.delta",
 						Data: map[string]interface{}{"delta": content},
-					}); err != nil {
-						return err
+					}); evErr != nil {
+						return evErr
 					}
 				}
+			} else {
+				// Non-SSE path: full JSON body in one chunk
+				processUpstreamJSON(chunk, &currentToolCall, &toolCalls, &contentBuilder, onEvent)
 			}
 			return nil
 		})
@@ -371,7 +359,33 @@ func (e *ReActEngine) ProcessStream(ctx context.Context, req *model.ResponsesReq
 			toolCalls = append(toolCalls, currentToolCall)
 		}
 		if len(toolCalls) == 0 {
-			_ = contentBuilder.String()
+			// In the non-native-tools path, the model emits <action>...</action>
+			// tags in the text. Check for that before bailing.
+			content := contentBuilder.String()
+			if action, ok := parseAction(content); ok && requestHasTool(req.Tools, action.Name) {
+				toolCalls = []map[string]interface{}{{
+					"id":   "call_" + strconv.FormatInt(time.Now().UnixNano(), 10),
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":      action.Name,
+						"arguments": argumentsJSONString(action.Arguments),
+					},
+				}}
+			}
+		}
+
+		if len(toolCalls) == 0 {
+			break
+		}
+
+		// When onToolCall is provided (Anthropic streaming path), report tool
+		// calls to the handler and stop -- the client (Claude Code) will resume
+		// with a follow-up request that includes tool_result blocks. The server
+		// does NOT execute tools on the client's behalf in this path.
+		if onToolCall != nil {
+			for _, tc := range toolCalls {
+				onToolCall(tc)
+			}
 			break
 		}
 
@@ -542,6 +556,62 @@ func responseInputItemToChatMessages(item interface{}, nativeTools bool) []map[s
 			"tool_call_id": firstString(itemMap, "call_id", "id"),
 			"content":      stringifyJSONValue(itemMap["output"]),
 		}}
+
+	case "tool_use":
+		callID := firstString(itemMap, "id", "call_id")
+		name, _ := itemMap["name"].(string)
+		inputMap, _ := itemMap["input"].(map[string]interface{})
+		if !nativeTools {
+			return []map[string]interface{}{{
+				"role": "assistant",
+				"content": fmt.Sprintf(`<action>{"name":%q,"arguments":%s}</action>`,
+					name, argumentsJSONString(inputMap)),
+			}}
+		}
+		return []map[string]interface{}{{
+			"role":    "assistant",
+			"content": "",
+			"tool_calls": []interface{}{map[string]interface{}{
+				"id":   callID,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": stringifyJSONValue(inputMap),
+				},
+			}},
+		}}
+
+	case "tool_result":
+		callID := firstString(itemMap, "call_id", "id")
+		content := stringifyJSONValue(itemMap["content"])
+		if !nativeTools {
+			return []map[string]interface{}{{
+				"role": "user",
+				"content": fmt.Sprintf(`<observation call_id=%q>%s</observation>`, callID, content),
+			}}
+		}
+		return []map[string]interface{}{{
+			"role":         "tool",
+			"tool_call_id": callID,
+			"content":      content,
+		}}
+
+	case "image":
+		return []map[string]interface{}{{
+			"role":    "user",
+			"content": "[image content]",
+		}}
+
+	case "document":
+		name := firstString(itemMap, "name")
+		if name == "" {
+			name = "document"
+		}
+		return []map[string]interface{}{{
+			"role":    "user",
+			"content": fmt.Sprintf("[document: %s]", name),
+		}}
+
 	default:
 		if role == "" {
 			return nil
@@ -628,6 +698,12 @@ func buildUpstreamRequest(req *model.ResponsesRequest, messages []map[string]int
 	}
 	if rawHas(req, "top_p") || req.TopP != 0 {
 		upstreamReq["top_p"] = req.TopP
+	}
+	if req.TopK != nil {
+		upstreamReq["top_k"] = *req.TopK
+	}
+	if len(req.StopSequences) > 0 {
+		upstreamReq["stop_sequences"] = req.StopSequences
 	}
 	if rawHas(req, "parallel_tool_calls") {
 		upstreamReq["parallel_tool_calls"] = req.ParallelToolCalls
@@ -977,6 +1053,75 @@ func mergeToolCallDelta(current map[string]interface{}, delta map[string]interfa
 	if args, ok := fnDelta["arguments"].(string); ok {
 		existingArgs, _ := fnCurrent["arguments"].(string)
 		fnCurrent["arguments"] = existingArgs + args
+	}
+}
+
+func parseDeltaFromSSEData(data string) (map[string]interface{}, error) {
+	var event map[string]interface{}
+	if err := json.Unmarshal([]byte(data), &event); err != nil {
+		return nil, err
+	}
+	choices, ok := event["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return nil, nil
+	}
+	choice, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return nil, nil
+	}
+	delta, ok := choice["delta"].(map[string]interface{})
+	if !ok {
+		return nil, nil
+	}
+	return delta, nil
+}
+
+func processUpstreamJSON(data []byte, currentToolCall *map[string]interface{}, toolCalls *[]map[string]interface{}, contentBuilder *strings.Builder, onEvent func(*model.SSEEvent) error) {
+	var event map[string]interface{}
+	if err := json.Unmarshal(data, &event); err != nil {
+		return
+	}
+	choices, ok := event["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return
+	}
+	choice, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return
+	}
+	delta, ok := choice["delta"].(map[string]interface{})
+	if !ok {
+		// Non-streaming response format: message.content instead of delta.content
+		message, ok := choice["message"].(map[string]interface{})
+		if !ok {
+			return
+		}
+		if content, ok := message["content"].(string); ok && content != "" {
+			contentBuilder.WriteString(content)
+			if onEvent != nil {
+				_ = onEvent(&model.SSEEvent{
+					Type: "response.output_text.delta",
+					Data: map[string]interface{}{"delta": content},
+				})
+			}
+		}
+		rawToolCalls, ok := message["tool_calls"].([]interface{})
+		if ok && len(rawToolCalls) > 0 {
+			mergeStreamingToolCalls(map[string]interface{}{"tool_calls": rawToolCalls}, currentToolCall, toolCalls)
+		}
+		return
+	}
+
+	mergeStreamingToolCalls(delta, currentToolCall, toolCalls)
+
+	if content, ok := delta["content"].(string); ok && content != "" {
+		contentBuilder.WriteString(content)
+		if onEvent != nil {
+			_ = onEvent(&model.SSEEvent{
+				Type: "response.output_text.delta",
+				Data: map[string]interface{}{"delta": content},
+			})
+		}
 	}
 }
 
